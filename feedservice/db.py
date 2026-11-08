@@ -1,0 +1,132 @@
+"""Database schema and session handling (SQLAlchemy 2.0, PostgreSQL)."""
+
+import enum
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import datetime
+from decimal import Decimal
+
+from sqlalchemy import (
+    DateTime,
+    Enum,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    create_engine,
+    func,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+
+from .config import settings
+
+
+class FeedStatus(enum.StrEnum):
+    PROCESSING = "processing"
+    DONE = "done"
+    FAILED = "failed"
+
+
+class ImageStatus(enum.StrEnum):
+    PENDING = "pending"
+    DOWNLOADED = "downloaded"
+    FAILED = "failed"
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def _enum(cls: type[enum.Enum]) -> Enum:
+    return Enum(cls, values_callable=lambda e: [m.value for m in e], native_enum=False)
+
+
+class Feed(Base):
+    __tablename__ = "feeds"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    status: Mapped[FeedStatus] = mapped_column(_enum(FeedStatus), default=FeedStatus.PROCESSING)
+    # Set once all items are stored; the feed is "done" when this is set and no
+    # image is pending any more.
+    parsed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class Item(Base):
+    __tablename__ = "items"
+
+    feed_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("feeds.id", ondelete="CASCADE"), primary_key=True
+    )
+    # The customer's own ID (<g:id>), unique only within a feed.
+    item_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    title: Mapped[str | None] = mapped_column(Text)
+    description: Mapped[str | None] = mapped_column(Text)
+    link: Mapped[str | None] = mapped_column(Text)
+    price: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    sale_price: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    currency: Mapped[str | None] = mapped_column(String(3))
+    condition: Mapped[str | None] = mapped_column(String(64))
+    availability: Mapped[str | None] = mapped_column(String(64))
+    brand: Mapped[str | None] = mapped_column(Text)
+    gtin: Mapped[str | None] = mapped_column(String(64))
+    item_group_id: Mapped[str | None] = mapped_column(String(255))
+
+
+class Image(Base):
+    __tablename__ = "images"
+
+    # Deterministic: uuid5(feed_id, url). A retried task computes the same ID,
+    # so it cannot create a duplicate, and the same URL used by several items
+    # of one feed is downloaded only once.
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    feed_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("feeds.id", ondelete="CASCADE"), index=True
+    )
+    url: Mapped[str] = mapped_column(Text)
+    status: Mapped[ImageStatus] = mapped_column(_enum(ImageStatus), default=ImageStatus.PENDING)
+    content_type: Mapped[str | None] = mapped_column(String(127))
+    size_bytes: Mapped[int | None] = mapped_column(Integer)
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class ItemImage(Base):
+    """Which images belong to which item, in feed order (0 = main image)."""
+
+    __tablename__ = "item_images"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["feed_id", "item_id"], ["items.feed_id", "items.item_id"], ondelete="CASCADE"
+        ),
+    )
+
+    feed_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    item_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    position: Mapped[int] = mapped_column(primary_key=True)
+    image_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("images.id", ondelete="CASCADE"))
+
+
+engine = create_engine(settings.database_url, pool_pre_ping=True)
+SessionLocal = sessionmaker(engine, expire_on_commit=False)
+
+
+def init_db() -> None:
+    # Good enough for an assignment; a real service would use Alembic migrations.
+    Base.metadata.create_all(engine)
+
+
+@contextmanager
+def session_scope() -> Iterator[Session]:
+    with SessionLocal() as session, session.begin():
+        yield session
+
+
+def image_id_for(feed_id: uuid.UUID, url: str) -> uuid.UUID:
+    return uuid.uuid5(feed_id, url)

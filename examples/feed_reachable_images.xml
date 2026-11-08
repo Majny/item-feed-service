@@ -1,0 +1,53 @@
+<?xml version="1.0"?>
+<rss xmlns:g="http://base.google.com/ns/1.0" version="2.0">
+<channel>
+	<title>Feed Example</title>
+	<link>recombee.com</link>
+	<description></description>
+	<item>
+		<g:id>M0296</g:id>
+		<title>Bodylab Men&#39;&#39;s T-shirt - Black</title>
+		<description>Bodylab Activewear - Release the Feeling Nå tenker du kanskje at dette bare er enda en t-skjorte. Og det er det jo for så vidt også, men det er stor forskjell på trenings-t-skjorter! For som alt det andre treningstøyet vårt er den designet med henblikk på kroppen i bevegelse. Her får du en high-performance trenings-t-skjorte i elastisk og superlett stoff med eksepsjonelt god svettetransport og pusteegenskaper. T-skjorten har dessuten mesh-paneler under armene, slik at kroppen kan kvitte seg med varmen når du trener hardt. Det er kort sagt en svært allsidig og komfortabel t-skjorte som du kan bruke til alt fra høyintensiv styrketrening til løping. Velg mellom fargene black og micro chip (grå). Modellen på bildet er 189 cm og bruker størrelse M.</description>
+		<link>https://bodylab.no/shop/mens-t-shirt-black-4059p.html</link>
+		<g:image_link>https://www.python.org/static/img/python-logo.png</g:image_link>
+		<g:additional_image_link>https://httpbin.org/image/jpeg</g:additional_image_link>
+		<g:additional_image_link>https://www.bodylab.no/images/products/minimum-deluxe-protein-bar-chocolate-chip-cookie-dough-p.png</g:additional_image_link>
+		<g:price>299.00 NOK</g:price>
+		<g:condition>new</g:condition>
+		<g:availability>in stock</g:availability>
+		<g:brand>Bodylab</g:brand>
+		<g:gtin>5711657018069</g:gtin>
+		<g:item_group_id>M0296</g:item_group_id>
+		<g:sale_price></g:sale_price>
+	</item>
+	<item>
+		<g:id>6446</g:id>
+		<title>Bodylab Men&#39;&#39;s T-shirt - Black - Large</title>
+		<description>Bodylab Activewear - Release the Feeling Nå tenker du kanskje at dette bare er enda en t-skjorte. Og det er det jo for så vidt også, men det er stor forskjell på trenings-t-skjorter! For som alt det andre treningstøyet vårt er den designet med henblikk på kroppen i bevegelse. Her får du en high-performance trenings-t-skjorte i elastisk og superlett stoff med eksepsjonelt god svettetransport og pusteegenskaper. T-skjorten har dessuten mesh-paneler under armene, slik at kroppen kan kvitte seg med varmen når du trener hardt. Det er kort sagt en svært allsidig og komfortabel t-skjorte som du kan bruke til alt fra høyintensiv styrketrening til løping. Velg mellom fargene black og micro chip (grå). Modellen på bildet er 189 cm og bruker størrelse M.</description>
+		<link>https://bodylab.no/shop/mens-t-shirt-black-large-4062p.html</link>
+		<g:image_link>https://www.python.org/static/img/python-logo.png</g:image_link>
+		<g:price>299.00 NOK</g:price>
+		<g:condition>new</g:condition>
+		<g:availability>in stock</g:availability>
+		<g:brand>Bodylab</g:brand>
+		<g:gtin>5711657018083</g:gtin>
+		<g:item_group_id>6446</g:item_group_id>
+		<g:sale_price></g:sale_price>
+	</item>
+	<item>
+		<g:id>6445</g:id>
+		<title>Bodylab Men&#39;&#39;s T-shirt - Black - Medium</title>
+		<description>Bodylab Activewear - Release the Feeling Nå tenker du kanskje at dette bare er enda en t-skjorte. Og det er det jo for så vidt også, men det er stor forskjell på trenings-t-skjorter! For som alt det andre treningstøyet vårt er den designet med henblikk på kroppen i bevegelse. Her får du en high-performance trenings-t-skjorte i elastisk og superlett stoff med eksepsjonelt god svettetransport og pusteegenskaper. T-skjorten har dessuten mesh-paneler under armene, slik at kroppen kan kvitte seg med varmen når du trener hardt. Det er kort sagt en svært allsidig og komfortabel t-skjorte som du kan bruke til alt fra høyintensiv styrketrening til løping. Velg mellom fargene black og micro chip (grå). Modellen på bildet er 189 cm og bruker størrelse M.</description>
+		<link>https://bodylab.no/shop/mens-t-shirt-black-medium-4061p.html</link>
+		<g:image_link>https://www.python.org/static/img/python-logo.png</g:image_link>
+		<g:additional_image_link>https://httpbin.org/status/503</g:additional_image_link>
+		<g:price>299.00 NOK</g:price>
+		<g:condition>new</g:condition>
+		<g:availability>in stock</g:availability>
+		<g:brand>Bodylab</g:brand>
+		<g:gtin>5711657018076</g:gtin>
+		<g:item_group_id>6445</g:item_group_id>
+		<g:sale_price></g:sale_price>
+	</item>
+</channel>
+</rss>
