@@ -1,13 +1,16 @@
 """Image download: the one place where we consume someone else's HTTP API.
 
-The remote host is treated as unreliable: hard timeouts, a size cap checked
-while streaming, a content-type check, limited redirects, and a clear split
-between retryable and permanent errors (with Retry-After passed along).
+The remote host is treated as unreliable: per-read timeouts plus a deadline
+for reading the body (a host can drip bytes slowly enough to never trip a
+read timeout), a size cap checked while streaming, a content-type check,
+limited redirects, and a clear split between retryable and permanent errors
+(with Retry-After passed along).
 """
 
 import os
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -74,12 +77,11 @@ def _retry_after(value: str | None) -> float | None:
 def download_image(url: str, dest: Path) -> DownloadedImage:
     """Stream `url` into `dest`. The file appears atomically or not at all."""
     dest.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + settings.image_deadline_s
     try:
         with http_client().stream("GET", url) as resp:
             if resp.status_code == 429 or resp.status_code >= 500:
-                raise TransientDownloadError(
-                    f"HTTP {resp.status_code}", _retry_after(resp.headers.get("retry-after"))
-                )
+                raise TransientDownloadError(f"HTTP {resp.status_code}", _retry_after(resp.headers.get("retry-after")))
             if resp.status_code != 200:
                 raise PermanentDownloadError(f"HTTP {resp.status_code}")
 
@@ -94,11 +96,15 @@ def download_image(url: str, dest: Path) -> DownloadedImage:
             size = 0
             try:
                 with os.fdopen(fd, "wb") as fh:
-                    for chunk in resp.iter_bytes(64 * 1024):
+                    # No chunk_size: with one, httpx buffers until it is full and a
+                    # byte-dripping host would never reach the deadline check.
+                    for chunk in resp.iter_bytes():
                         size += len(chunk)
                         # Content-Length can be missing or lie, so count.
                         if size > settings.max_image_bytes:
                             raise PermanentDownloadError(f"too large: over {size} bytes")
+                        if time.monotonic() > deadline:
+                            raise TransientDownloadError(f"download slower than {settings.image_deadline_s:g} s")
                         fh.write(chunk)
                 os.replace(tmp_name, dest)
             except BaseException:
@@ -106,6 +112,9 @@ def download_image(url: str, dest: Path) -> DownloadedImage:
                 raise
     except httpx.InvalidURL as exc:
         raise PermanentDownloadError(f"invalid URL: {exc}") from exc
+    except (httpx.TooManyRedirects, httpx.UnsupportedProtocol) as exc:
+        # A redirect loop or a redirect to e.g. ftp:// will not fix itself.
+        raise PermanentDownloadError(f"{type(exc).__name__}: {exc}") from exc
     except httpx.HTTPError as exc:  # timeouts, connection errors, protocol errors
         raise TransientDownloadError(f"{type(exc).__name__}: {exc}") from exc
     return DownloadedImage(content_type=content_type, size_bytes=size)

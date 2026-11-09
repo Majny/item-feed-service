@@ -35,7 +35,12 @@ def test_xxe_is_rejected():
 
 @pytest.mark.parametrize(
     "raw, expected",
-    [("299.00 NOK", (Decimal("299.00"), "NOK")), ("12,5", (Decimal("12.5"), None)), ("", (None, None)), ("free", (None, None))],
+    [
+        ("299.00 NOK", (Decimal("299.00"), "NOK")),
+        ("12,5", (Decimal("12.5"), None)),
+        ("", (None, None)),
+        ("free", (None, None)),
+    ],
 )
 def test_parse_price(raw, expected):
     assert parse_price(raw) == expected

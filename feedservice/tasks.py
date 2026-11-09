@@ -12,7 +12,12 @@ Reliability model:
     recorded right away instead of being retried.
   * Every task is idempotent, so a redelivery or retry never duplicates data:
     items are upserted by (feed_id, item_id), image IDs are deterministic
-    (uuid5 of feed ID + URL) and image files are written atomically.
+    (uuid5 of feed ID + URL) and image files are written atomically. A
+    redelivered task whose work is already done still re-runs the (idempotent)
+    feed completion check, in case the first delivery died right before it.
+  * Dramatiq's TimeLimitExceeded is a BaseException, so it is caught
+    explicitly: a task killed by its time limit on the last attempt still
+    records the failure instead of leaving its row "pending" forever.
   * One broken image never fails the feed: it is marked "failed" on the image
     row and the feed still finishes.
   * Feed status is derived from DB state (all items stored and no image still
@@ -29,13 +34,13 @@ from datetime import UTC, datetime
 import dramatiq
 from dramatiq.brokers.rabbitmq import RabbitmqBroker
 from dramatiq.brokers.stub import StubBroker
-from dramatiq.middleware import CurrentMessage
-from sqlalchemy import exists, select, update
+from dramatiq.middleware import CurrentMessage, TimeLimitExceeded
+from sqlalchemy import delete, exists, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from .config import settings
 from .db import Feed, FeedStatus, Image, ImageStatus, Item, ItemImage, image_id_for, session_scope
-from .images import PermanentDownloadError, download_image, image_path
+from .images import PermanentDownloadError, TransientDownloadError, download_image, image_path
 from .parser import FeedParseError, ParsedItem, iter_items
 
 log = logging.getLogger(__name__)
@@ -55,6 +60,13 @@ RETRY_OPTIONS = dict(
     max_backoff=settings.max_backoff_ms,
 )
 BATCH_SIZE = 500
+# Below RabbitMQ's default consumer_timeout (30 min): past that RabbitMQ would
+# redeliver the unacked message while the first worker is still parsing. The
+# feed-worker prefetches only one message per thread for the same reason.
+FEED_TIME_LIMIT_MS = 25 * 60 * 1000
+# Above settings.image_deadline_s + one read timeout, so a slow download ends
+# as a normal TransientDownloadError; the time limit is only a backstop.
+IMAGE_TIME_LIMIT_MS = 2 * 60 * 1000
 
 
 def _is_last_attempt() -> bool:
@@ -65,35 +77,33 @@ def _is_last_attempt() -> bool:
 # --------------------------------------------------------------------------- feed
 
 
-@dramatiq.actor(queue_name="feeds", time_limit=60 * 60 * 1000, **RETRY_OPTIONS)
+@dramatiq.actor(queue_name="feeds", time_limit=FEED_TIME_LIMIT_MS, **RETRY_OPTIONS)
 def process_feed(feed_id: str) -> None:
     fid = uuid.UUID(feed_id)
     with session_scope() as s:
         feed = s.get(Feed, fid)
         if feed is None or feed.status != FeedStatus.PROCESSING:
-            log.info("feed %s: already finished, skipping duplicate delivery", fid)
+            log.info("feed=%s: already finished, skipping duplicate delivery", fid)
             return
         already_parsed = feed.parsed_at is not None
 
     if not already_parsed:
         try:
             _store_items(fid)
-        except Exception as exc:
+        except (Exception, TimeLimitExceeded) as exc:
             if _is_last_attempt():
-                log.exception("feed %s: giving up after retries", fid)
-                _fail_feed(fid, f"processing failed after retries: {exc}")
+                log.exception("feed=%s: giving up after retries", fid)
+                _fail_feed(fid, f"processing failed after retries: {exc!r}")
             else:
-                log.warning("feed %s: processing failed, will retry: %s", fid, exc)
+                log.warning("feed=%s: processing failed, will retry: %r", fid, exc)
             # Dramatiq retries with backoff; after the last attempt the message
-            # goes to the dead-letter queue (feeds.XQ) for inspection/replay.
+            # goes to the dead-letter queue (feeds.XQ) for inspection.
             raise
 
     # Enqueue (again) every image that is not finished yet. Duplicate messages
-    # are harmless because download_image skips images that are not pending.
+    # are harmless because fetch_image skips images that are not pending.
     with session_scope() as s:
-        pending = s.scalars(
-            select(Image.id).where(Image.feed_id == fid, Image.status == ImageStatus.PENDING)
-        ).all()
+        pending = s.scalars(select(Image.id).where(Image.feed_id == fid, Image.status == ImageStatus.PENDING)).all()
     for image_id in pending:
         fetch_image.send(str(image_id))
     _finish_feed_if_complete(fid)
@@ -120,7 +130,7 @@ def _store_items(fid: uuid.UUID) -> None:
         _upsert_batch(fid, batch)
         count += len(batch)
     if parse_error:
-        log.warning("feed %s: parse error after %d items: %s", fid, count, parse_error)
+        log.warning("feed=%s: parse error after %d items: %s", fid, count, parse_error)
 
     with session_scope() as s:
         feed = s.get(Feed, fid)
@@ -129,20 +139,30 @@ def _store_items(fid: uuid.UUID) -> None:
             feed.error = f"invalid XML after {count} items: {parse_error}"
             if count == 0:
                 feed.status = FeedStatus.FAILED
-    log.info("feed %s: stored %d items", fid, count)
+    log.info("feed=%s: stored %d items", fid, count)
 
 
 def _upsert_batch(fid: uuid.UUID, batch: list[ParsedItem]) -> None:
-    # If an ID appears twice in a feed, the later definition wins.
+    # If an ID appears twice in a feed, the later definition wins (also across
+    # batches: the item row is overwritten and its old image links deleted).
     by_id = {item.item_id: item for item in batch}
     item_rows, image_rows, link_rows = [], {}, []
     for it in by_id.values():
         item_rows.append(
             dict(
-                feed_id=fid, item_id=it.item_id, title=it.title, description=it.description,
-                link=it.link, price=it.price, sale_price=it.sale_price, currency=it.currency,
-                condition=it.condition, availability=it.availability, brand=it.brand,
-                gtin=it.gtin, item_group_id=it.item_group_id,
+                feed_id=fid,
+                item_id=it.item_id,
+                title=it.title,
+                description=it.description,
+                link=it.link,
+                price=it.price,
+                sale_price=it.sale_price,
+                currency=it.currency,
+                condition=it.condition,
+                availability=it.availability,
+                brand=it.brand,
+                gtin=it.gtin,
+                item_group_id=it.item_group_id,
             )
         )
         for position, url in enumerate(it.image_urls):
@@ -152,17 +172,22 @@ def _upsert_batch(fid: uuid.UUID, batch: list[ParsedItem]) -> None:
 
     with session_scope() as s:
         stmt = insert(Item).values(item_rows)
-        s.execute(stmt.on_conflict_do_update(
-            index_elements=[Item.feed_id, Item.item_id],
-            set_={c: stmt.excluded[c] for c in item_rows[0] if c not in ("feed_id", "item_id")},
-        ))
+        s.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[Item.feed_id, Item.item_id],
+                set_={c: stmt.excluded[c] for c in item_rows[0] if c not in ("feed_id", "item_id")},
+            )
+        )
+        s.execute(delete(ItemImage).where(ItemImage.feed_id == fid, ItemImage.item_id.in_(list(by_id))))
         if image_rows:
             s.execute(insert(Image).values(list(image_rows.values())).on_conflict_do_nothing())
             stmt = insert(ItemImage).values(link_rows)
-            s.execute(stmt.on_conflict_do_update(
-                index_elements=[ItemImage.feed_id, ItemImage.item_id, ItemImage.position],
-                set_={"image_id": stmt.excluded.image_id},
-            ))
+            s.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[ItemImage.feed_id, ItemImage.item_id, ItemImage.position],
+                    set_={"image_id": stmt.excluded.image_id},
+                )
+            )
 
 
 def _fail_feed(fid: uuid.UUID, error: str) -> None:
@@ -185,49 +210,68 @@ def _finish_feed_if_complete(fid: uuid.UUID) -> None:
             .values(status=FeedStatus.DONE)
         )
     if result.rowcount:
-        log.info("feed %s: done", fid)
+        log.info("feed=%s: done", fid)
 
 
 # -------------------------------------------------------------------------- image
 
 
-@dramatiq.actor(queue_name="images", time_limit=2 * 60 * 1000, **RETRY_OPTIONS)
+@dramatiq.actor(queue_name="images", time_limit=IMAGE_TIME_LIMIT_MS, **RETRY_OPTIONS)
 def fetch_image(image_id: str) -> None:
     iid = uuid.UUID(image_id)
     with session_scope() as s:
         image = s.get(Image, iid)
-        if image is None or image.status != ImageStatus.PENDING:
+        if image is None:
             return
-        url, fid = image.url, image.feed_id
+        url, fid, current = image.url, image.feed_id, image.status
+
+    if current != ImageStatus.PENDING:
+        # Duplicate or redelivered message. The work is done, but an earlier
+        # delivery may have died between committing the image status and the
+        # completion check, so run the (idempotent) check again.
+        _finish_feed_if_complete(fid)
+        return
 
     try:
         result = download_image(url, image_path(iid))
     except PermanentDownloadError as exc:
-        log.info("image %s: failed permanently (%s): %s", iid, exc, url)
+        log.info("feed=%s image=%s: failed permanently (%s): %s", fid, iid, exc, url)
         _set_image(iid, ImageStatus.FAILED, error=str(exc))
-    except Exception as exc:  # TransientDownloadError, or e.g. a DB hiccup
+    except (Exception, TimeLimitExceeded) as exc:  # TransientDownloadError, time limit, bugs
         if not _is_last_attempt():
-            log.info("image %s: will retry (%s): %s", iid, exc, url)
+            if not isinstance(exc, (TransientDownloadError, TimeLimitExceeded)):
+                raise  # unexpected (disk full, a bug): retried, but logged with a traceback
+            log.info("feed=%s image=%s: will retry (%r): %s", fid, iid, exc, url)
+            # dramatiq.Retry is the expected-retry path: same backoff and
+            # retry counting as any exception, but not logged as an error.
+            # delay=None means the normal exponential backoff.
+            delay = None
             retry_after = getattr(exc, "retry_after_s", None)
             if retry_after is not None:
-                # Respect the server's Retry-After (capped by our max backoff).
-                delay_ms = min(int(retry_after * 1000), settings.max_backoff_ms)
-                raise dramatiq.Retry(str(exc), delay=max(delay_ms, settings.min_backoff_ms)) from exc
-            raise
+                # Respect the server's Retry-After, within our backoff bounds.
+                delay = min(max(int(retry_after * 1000), settings.min_backoff_ms), settings.max_backoff_ms)
+            raise dramatiq.Retry(str(exc), delay=delay) from exc
         # Record the failure so the feed can finish, then re-raise so the
         # message ends up in the dead-letter queue (images.XQ).
-        log.warning("image %s: giving up after retries (%s): %s", iid, exc, url)
-        _set_image(iid, ImageStatus.FAILED, error=f"gave up after retries: {exc}")
+        log.warning("feed=%s image=%s: giving up after retries (%r): %s", fid, iid, exc, url)
+        _set_image(iid, ImageStatus.FAILED, error=f"gave up after retries: {exc!r}")
         _finish_feed_if_complete(fid)
         raise
     else:
         _set_image(
-            iid, ImageStatus.DOWNLOADED,
-            content_type=result.content_type, size_bytes=result.size_bytes, error=None,
+            iid,
+            ImageStatus.DOWNLOADED,
+            content_type=result.content_type,
+            size_bytes=result.size_bytes,
+            error=None,
         )
     _finish_feed_if_complete(fid)
 
 
 def _set_image(iid: uuid.UUID, status: ImageStatus, **values: object) -> None:
+    # Only a pending image changes: if two deliveries of one message race, the
+    # first result wins and a later one cannot overwrite it.
     with session_scope() as s:
-        s.execute(update(Image).where(Image.id == iid).values(status=status, **values))
+        s.execute(
+            update(Image).where(Image.id == iid, Image.status == ImageStatus.PENDING).values(status=status, **values)
+        )

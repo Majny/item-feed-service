@@ -10,6 +10,7 @@ os.environ.setdefault("TASK_MIN_BACKOFF_MS", "50")
 os.environ.setdefault("TASK_MAX_BACKOFF_MS", "200")
 
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -38,9 +39,17 @@ PNG = (
 )
 
 
+@pytest.fixture(scope="session", autouse=True)
+def fresh_schema():
+    # create_all does not migrate, so a feeds_test left over from an older
+    # schema would fail with missing columns. Rebuild it; never outside *_test.
+    assert db.engine.url.database.endswith("_test"), db.engine.url
+    db.Base.metadata.drop_all(db.engine)
+    db.init_db()
+
+
 @pytest.fixture(autouse=True)
 def clean_db():
-    db.init_db()
     yield
     with db.engine.begin() as conn:
         conn.execute(text("TRUNCATE feeds, items, images, item_images CASCADE"))
@@ -72,6 +81,22 @@ def image_server():
                     self._send(200, "image/png", PNG)
             elif self.path == "/page.html":
                 self._send(200, "text/html", b"<html>not an image</html>")
+            elif self.path == "/loop.png":  # redirects to itself forever
+                self.send_response(302)
+                self.send_header("Location", "/loop.png")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            elif self.path == "/drip.png":  # a valid start, then one byte every 0.1 s
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.end_headers()
+                try:
+                    for byte in PNG[:30]:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(0.1)
+                except OSError:  # the client gave up, as it should
+                    pass
             else:
                 self._send(404, "text/plain", b"not found")
 

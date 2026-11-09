@@ -3,6 +3,7 @@ worker process it (stub broker, real PostgreSQL) and read everything back."""
 
 import time
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,7 @@ from sqlalchemy import func, select
 from feedservice import tasks
 from feedservice.api import app
 from feedservice.config import settings
-from feedservice.db import Feed, Image, Item, ItemImage, session_scope
+from feedservice.db import Feed, Image, ImageStatus, Item, ItemImage, image_id_for, session_scope
 
 from .conftest import PNG
 
@@ -42,6 +43,7 @@ def client():
 
 def wait_until_finished(client, feed_id, timeout=15):
     deadline = time.monotonic() + timeout
+    body = None
     while time.monotonic() < deadline:
         body = client.get(f"/feeds/{feed_id}").json()
         if body["status"] != "processing":
@@ -151,3 +153,122 @@ def test_unknown_resources_return_404(client, worker, image_server):
     wait_until_finished(client, feed_id)
     assert client.get(f"/feeds/{feed_id}/items/nope").status_code == 404
     assert client.get(f"/feeds/{feed_id}/images/{missing}").status_code == 404
+
+
+def test_redelivery_after_a_crash_still_finishes_the_feed(client, worker):
+    """The worker committed the image status and died before the feed
+    completion check. The redelivered message must run that check, otherwise
+    the feed stays "processing" forever."""
+    feed_id = uuid.uuid4()
+    image_id = image_id_for(feed_id, "http://example.invalid/a.png")
+    with session_scope() as s:
+        s.add(Feed(id=feed_id, parsed_at=datetime.now(UTC)))
+        s.flush()
+        s.add(Image(id=image_id, feed_id=feed_id, url="http://example.invalid/a.png", status=ImageStatus.DOWNLOADED))
+
+    tasks.fetch_image.send(str(image_id))
+    assert wait_until_finished(client, feed_id)["status"] == "done"
+
+
+def test_time_limit_on_the_last_attempt_is_recorded(client, worker, image_server, monkeypatch):
+    """TimeLimitExceeded is a BaseException; it must still end as a failed
+    image (and a finished feed), not as an image pending forever."""
+    from dramatiq.middleware import TimeLimitExceeded
+
+    def killed(*_args, **_kwargs):
+        raise TimeLimitExceeded()
+
+    monkeypatch.setattr(tasks, "download_image", killed)
+    feed_id = client.post("/feeds", content=example_feed(image_server.base_url), headers=XML).json()["id"]
+    feed = wait_until_finished(client, feed_id)
+    assert feed["status"] == "done"
+    assert feed["images"] == {"pending": 0, "downloaded": 0, "failed": 4}
+    item = client.get(f"/feeds/{feed_id}/items/M0296").json()
+    assert all(i["status"] == "failed" for i in item["images"])
+
+
+def test_retried_upload_with_idempotency_key_creates_one_feed(client, worker, image_server):
+    body = example_feed(image_server.base_url)
+    headers = {**XML, "Idempotency-Key": "upload-1"}
+    first = client.post("/feeds", content=body, headers=headers)
+    retry = client.post("/feeds", content=body, headers=headers)  # e.g. the 202 got lost
+
+    assert first.status_code == retry.status_code == 202
+    assert retry.json() == first.json()
+    assert retry.headers["idempotent-replayed"] == "true"
+    other = client.post("/feeds", content=body, headers={**XML, "Idempotency-Key": "upload-2"})
+    assert other.json() != first.json()
+    with session_scope() as s:
+        assert s.scalar(select(func.count()).select_from(Feed)) == 2
+
+
+def test_queue_outage_returns_503_and_leaves_nothing_behind(client, monkeypatch):
+    def broker_down(*_args, **_kwargs):
+        raise ConnectionError("broker down")
+
+    monkeypatch.setattr(tasks.process_feed, "send", broker_down)
+    files_before = set(settings.feeds_dir.iterdir())
+    resp = client.post("/feeds", content=b"<rss/>", headers=XML)
+
+    assert resp.status_code == 503
+    assert resp.headers["retry-after"]
+    assert resp.json()["error"]["message"] == "queue unavailable, try again"
+    with session_scope() as s:  # the client never got an ID: no orphan row or file
+        assert s.scalar(select(func.count()).select_from(Feed)) == 0
+    assert set(settings.feeds_dir.iterdir()) == files_before
+
+
+def test_keyed_retry_after_a_queue_outage_publishes_again(client, worker, image_server, monkeypatch):
+    """The first attempt fails to publish (or the client never sees the
+    answer). The retry with the same key must not create a second feed and
+    must not return a feed that is never processed."""
+    send = tasks.process_feed.send
+
+    def broker_down(*_args, **_kwargs):
+        raise ConnectionError("broker down")
+
+    headers = {**XML, "Idempotency-Key": "retry-me"}
+    body = example_feed(image_server.base_url)
+    monkeypatch.setattr(tasks.process_feed, "send", broker_down)
+    assert client.post("/feeds", content=body, headers=headers).status_code == 503
+
+    monkeypatch.setattr(tasks.process_feed, "send", send)  # the broker is back
+    retry = client.post("/feeds", content=body, headers=headers)
+    assert retry.status_code == 202
+    assert wait_until_finished(client, retry.json()["id"])["status"] == "done"
+    with session_scope() as s:
+        assert s.scalar(select(func.count()).select_from(Feed)) == 1
+
+
+def test_empty_idempotency_key_is_rejected(client):
+    resp = client.post("/feeds", content=b"<rss/>", headers={**XML, "Idempotency-Key": ""})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["details"]
+
+
+def test_item_repeated_in_a_later_batch_keeps_only_its_last_images(client, worker, image_server, monkeypatch):
+    monkeypatch.setattr(tasks, "BATCH_SIZE", 1)
+    base = image_server.base_url
+    xml = f"""<rss xmlns:g="http://base.google.com/ns/1.0"><channel>
+<item><g:id>dup</g:id><g:image_link>{base}/ok.png</g:image_link>
+      <g:additional_image_link>{base}/missing.png</g:additional_image_link></item>
+<item><g:id>other</g:id></item>
+<item><g:id>dup</g:id><title>second</title><g:image_link>{base}/flaky.png</g:image_link></item>
+</channel></rss>""".encode()
+    feed_id = client.post("/feeds", content=xml, headers=XML).json()["id"]
+    assert wait_until_finished(client, feed_id)["status"] == "done"
+
+    item = client.get(f"/feeds/{feed_id}/items/dup").json()
+    assert item["title"] == "second"
+    # Images of the superseded definition are still fetched (a known, harmless
+    # leftover: they are just not linked to any item).
+    assert [i["url"] for i in item["images"]] == [f"{base}/flaky.png"]
+
+
+def test_item_id_with_a_slash_can_be_fetched(client, worker):
+    xml = b"""<rss xmlns:g="http://base.google.com/ns/1.0"><channel>
+<item><g:id>SKU/1</g:id><title>slashed</title></item></channel></rss>"""
+    feed_id = client.post("/feeds", content=xml, headers=XML).json()["id"]
+    wait_until_finished(client, feed_id)
+    assert client.get(f"/feeds/{feed_id}/items").json() == ["SKU/1"]
+    assert client.get(f"/feeds/{feed_id}/items/SKU%2F1").json()["title"] == "slashed"

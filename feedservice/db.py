@@ -53,6 +53,14 @@ class Feed(Base):
     # image is pending any more.
     parsed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error: Mapped[str | None] = mapped_column(Text)
+    # Client-supplied Idempotency-Key of the upload: a retried POST with the
+    # same key returns this feed instead of creating a second one.
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), unique=True)
+    # The process_feed message was confirmed by the broker. A keyed retry of
+    # an upload whose publish failed or is still in flight publishes again
+    # (duplicate messages are harmless, the worker is idempotent). Tracked
+    # only for keyed uploads, the only ones that can be replayed.
+    enqueued: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -62,9 +70,7 @@ class Feed(Base):
 class Item(Base):
     __tablename__ = "items"
 
-    feed_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("feeds.id", ondelete="CASCADE"), primary_key=True
-    )
+    feed_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("feeds.id", ondelete="CASCADE"), primary_key=True)
     # The customer's own ID (<g:id>), unique only within a feed.
     item_id: Mapped[str] = mapped_column(String(255), primary_key=True)
     title: Mapped[str | None] = mapped_column(Text)
@@ -87,9 +93,7 @@ class Image(Base):
     # so it cannot create a duplicate, and the same URL used by several items
     # of one feed is downloaded only once.
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
-    feed_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("feeds.id", ondelete="CASCADE"), index=True
-    )
+    feed_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("feeds.id", ondelete="CASCADE"), index=True)
     url: Mapped[str] = mapped_column(Text)
     status: Mapped[ImageStatus] = mapped_column(_enum(ImageStatus), default=ImageStatus.PENDING)
     content_type: Mapped[str | None] = mapped_column(String(127))
@@ -102,9 +106,7 @@ class ItemImage(Base):
 
     __tablename__ = "item_images"
     __table_args__ = (
-        ForeignKeyConstraint(
-            ["feed_id", "item_id"], ["items.feed_id", "items.item_id"], ondelete="CASCADE"
-        ),
+        ForeignKeyConstraint(["feed_id", "item_id"], ["items.feed_id", "items.item_id"], ondelete="CASCADE"),
     )
 
     feed_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)

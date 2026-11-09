@@ -1,9 +1,11 @@
+x-env: &env
+  DATABASE_URL: postgresql+psycopg://feeds:feeds@db:5432/feeds
+  BROKER_URL: amqp://guest:guest@rabbitmq:5672/
+  DATA_DIR: /data
+
 x-app: &app
   build: .
-  environment:
-    DATABASE_URL: postgresql+psycopg://feeds:feeds@db:5432/feeds
-    BROKER_URL: amqp://guest:guest@rabbitmq:5672/
-    DATA_DIR: /data
+  environment: *env
   volumes:
     - data:/data
   depends_on:
@@ -23,6 +25,12 @@ services:
   feed-worker:
     <<: *app
     command: ["dramatiq", "feedservice.tasks", "--queues", "feeds", "--processes", "1", "--threads", "2"]
+    environment:
+      <<: *env
+      # Prefetch only as many messages as there are threads (Dramatiq's default
+      # is 2x). RabbitMQ's consumer_timeout counts from delivery, so a long
+      # feed message waiting in a local buffer could otherwise be redelivered.
+      dramatiq_queue_prefetch: "2"
 
   # Downloads images, one message per image. Network bound, so many threads;
   # scale with `docker compose up --scale image-worker=N`.
@@ -57,7 +65,7 @@ services:
       retries: 20
 
   # Test runner, not started by `docker compose up`:
-  #   docker compose run --rm tests
+  #   docker compose run --rm --build tests
   tests:
     build: .
     profiles: ["test"]
