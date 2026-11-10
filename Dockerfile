@@ -13,7 +13,7 @@ COPY requirements.lock ./
 RUN pip install -r requirements.lock
 COPY pyproject.toml ./
 COPY feedservice ./feedservice
-RUN pip install --no-deps .
+RUN pip install --no-deps . && rm -rf build ./*.egg-info
 
 # Run as an unprivileged user; /data is the shared volume for feeds and images.
 RUN useradd --create-home --uid 1000 app && mkdir -p /data && chown app:app /data
