@@ -1,0 +1,59 @@
+@startuml upload-sequence
+!include _style.iuml
+title Upload to "done" (happy path, with Idempotency-Key)
+autonumber
+
+actor Client
+participant "api\n(api.py + feeds.py)" as API
+database PostgreSQL as PG
+collections "/data volume" as VOL
+queue "RabbitMQ\nfeeds" as QF
+participant "feed-worker\nprocess_feed" as FW
+queue "RabbitMQ\nimages" as QI
+participant "image-worker\nfetch_image" as IW
+participant "Image host" as HOST
+
+Client -> API : POST /feeds\nContent-Type: application/xml\nIdempotency-Key: k1
+API -> API : check Content-Type (415)
+API -> PG : feed with key k1?
+PG --> API : none
+API -> API : declared Content-Length (413)
+API -> VOL : stream body to .upload-tmp (413 also while streaming),\ncheck non-empty (400), starts with "<" (422),\nrename to feeds/<id>.xml
+API -> PG : INSERT feed(id, processing, key k1)
+API -> QF : process_feed(id)
+QF --> API : publisher confirm
+API -> PG : UPDATE feed SET enqueued = true
+API --> Client : 202 {id}, Location: /feeds/<id>
+
+QF -> FW : deliver process_feed(id)
+FW -> PG : feed still processing, not parsed?
+loop items, batches of 500
+  FW -> VOL : iterparse next items
+  FW -> PG : upsert items, images (pending),\nreplace item_images
+end
+FW -> PG : SET parsed_at (and error if XML broke)
+FW -> PG : pending image IDs
+FW -> QI : fetch_image(image_id) for each
+FW -> PG : finish feed if complete
+FW --> QF : ack
+
+loop each image message (in parallel)
+  QI -> IW : deliver fetch_image(image_id)
+  IW -> PG : image still pending?
+  IW -> HOST : GET url
+  HOST --> IW : 200 image/*
+  IW -> VOL : write images/<image_id>
+  IW -> PG : SET downloaded WHERE status = pending
+  IW -> PG : UPDATE feed SET done WHERE parsed\nAND no pending image left
+  IW --> QI : ack
+end
+
+Client -> API : GET /feeds/<id>
+API -> PG : status + counts
+API --> Client : {"status": "done", "items": 3, "images": {...}}
+
+== Client lost the 202 and retries ==
+Client -> API : POST /feeds, Idempotency-Key: k1
+API -> PG : feed with key k1? (found, enqueued)
+API --> Client : 202 {same id}, Idempotent-Replayed: true
+@enduml

@@ -1,0 +1,59 @@
+@startuml data-model
+!include _style.iuml
+title Data model (PostgreSQL)
+hide circle
+skinparam linetype ortho
+
+entity feeds {
+  * id : uuid <<PK>>
+  --
+  * status : processing | done | failed
+  parsed_at : timestamptz
+  error : text
+  idempotency_key : varchar(255) <<UNIQUE>>
+  * enqueued : bool
+  * created_at : timestamptz
+  * updated_at : timestamptz
+}
+
+entity items {
+  * feed_id : uuid <<PK, FK>>
+  * item_id : varchar(255) <<PK>>  // the customer's g:id
+  --
+  title, description, link : text
+  price, sale_price : numeric(14,2)
+  currency : varchar(3)
+  condition, availability, gtin : varchar(64)
+  brand : text
+  item_group_id : varchar(255)
+}
+
+entity images {
+  * id : uuid <<PK>>  // uuid5(feed_id, url)
+  --
+  * feed_id : uuid <<FK>>
+  * url : text
+  * status : pending | downloaded | failed
+  content_type : varchar(127)
+  size_bytes : int
+  error : text
+}
+
+entity item_images {
+  * feed_id : uuid <<PK, FK>>
+  * item_id : varchar(255) <<PK, FK>>
+  * position : int <<PK>>  // 0 = main image
+  --
+  * image_id : uuid <<FK>>
+}
+
+feeds ||--o{ items
+feeds ||--o{ images
+items ||--o{ item_images
+images ||--o{ item_images
+
+note bottom of images
+  One row per distinct URL within a feed:
+  a URL used by several items is downloaded once.
+end note
+@enduml

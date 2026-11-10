@@ -1,0 +1,46 @@
+@startuml architecture
+!include _style.iuml
+title Architecture (docker compose)
+
+actor "Client\n(customer integration)" as client
+
+node "api (FastAPI)" as api {
+  component "HTTP routes\napi.py" as routes
+  component "Upload rules\nfeeds.py" as feeds
+}
+
+queue "RabbitMQ: feeds\n(dead letters: feeds.XQ)" as qf
+queue "RabbitMQ: images\n(dead letters: images.XQ)" as qi
+
+node "feed-worker (Dramatiq, 2 threads)" as fw {
+  component "process_feed\ntasks.py" as pf
+  component "streaming XML parser\nparser.py" as parser
+}
+
+node "image-worker (Dramatiq, 8 threads, scalable)" as iw {
+  component "fetch_image\ntasks.py" as fi
+  component "downloader\nimages.py" as dl
+}
+
+database "PostgreSQL\nfeeds, items, images, item_images" as pg
+storage "Shared volume /data\nfeeds/<id>.xml, images/<image_id>" as vol
+cloud "Customer's image hosts" as hosts
+
+client --> routes : POST /feeds (raw XML)\nGET status, items, images
+routes -right-> feeds
+feeds --> qf : (2) process_feed(feed_id)\npublisher confirms
+qf --> pf
+pf -right-> parser
+pf --> qi : (4) fetch_image(image_id)\nper pending image
+qi --> fi
+fi -right-> dl
+dl --> hosts : GET (timeouts, size cap,\nbody deadline)
+
+routes ..> vol : (1) stream upload to disk;\nserve image bytes
+feeds ..> pg : (1) feed row
+routes ..> pg : read queries
+parser ..> vol : read feed file
+pf ..> pg : (3) upsert items, images,\nitem_images in batches of 500
+fi ..> vol : (5) write image
+fi ..> pg : (5) image status,\nfeed completion check
+@enduml

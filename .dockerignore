@@ -5,3 +5,4 @@ data
 .git
 *.egg-info
 .ruff_cache
+docs

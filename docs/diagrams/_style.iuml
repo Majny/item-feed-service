@@ -1,0 +1,17 @@
+skinparam backgroundColor white
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 13
+skinparam shadowing false
+skinparam roundCorner 8
+skinparam ArrowColor #444444
+skinparam componentBorderColor #3b6ea5
+skinparam componentBackgroundColor #eef4fb
+skinparam queueBorderColor #b5651d
+skinparam queueBackgroundColor #fdf1e6
+skinparam databaseBorderColor #2e7d32
+skinparam databaseBackgroundColor #edf7ee
+skinparam noteBackgroundColor #fffbe6
+skinparam noteBorderColor #c9b458
+skinparam sequenceLifeLineBorderColor #999999
+skinparam sequenceParticipantBorderColor #3b6ea5
+skinparam sequenceParticipantBackgroundColor #eef4fb

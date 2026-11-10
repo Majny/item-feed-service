@@ -1,0 +1,36 @@
+@startuml states
+!include _style.iuml
+title Feed and image status
+hide empty description
+
+state "Feed" as Feed {
+  state "processing" as FProcessing
+  state "done" as FDone
+  state "failed" as FFailed
+  [*] --> FProcessing : POST /feeds accepted
+  FProcessing --> FProcessing : items stored\n(parsed_at set)
+  FProcessing --> FDone : parsed_at set\nAND no image pending
+  FProcessing --> FFailed : XML broken before the first item,\nor processing failed after all retries
+  FDone --> [*]
+  FFailed --> [*]
+  note bottom of FDone
+    "done" with an error message:
+    the XML broke after some items,
+    the items before the break are kept.
+  end note
+}
+
+state "Image" as Image {
+  state "pending" as IPending
+  state "downloaded" as IDownloaded
+  state "failed" as IFailed
+  [*] --> IPending : referenced by an item
+  IPending --> IPending : transient error,\nretry with backoff
+  IPending --> IDownloaded : 200 image/*
+  IPending --> IFailed : permanent error,\nor retries exhausted
+  IDownloaded --> [*]
+  IFailed --> [*]
+}
+
+Image -[hidden]right-> Feed
+@enduml

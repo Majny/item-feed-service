@@ -144,13 +144,22 @@ curl -i -X POST http://localhost:8000/feeds \
 
 ## Architecture and why
 
-```
-client -> api --(file on volume, row in Postgres, message)--> RabbitMQ
-                                                          |
-                     queue "feeds"  -> feed-worker  -> upsert items, images rows
-                                                       -> one message per image
-                     queue "images" -> image-worker -> download -> volume + row
-```
+![Architecture](docs/diagrams/architecture.svg)
+
+More diagrams (PlantUML sources next to the SVGs in `docs/diagrams/`):
+
+* [Upload to "done"](docs/diagrams/upload-sequence.svg): sequence of one feed,
+  including an `Idempotency-Key` replay
+* [Image download failures](docs/diagrams/failure-handling.svg): transient vs.
+  permanent errors, retries, dead letters, redelivery
+* [Feed and image status](docs/diagrams/states.svg): state machines
+* [Data model](docs/diagrams/data-model.svg)
+* [Use cases](docs/diagrams/use-cases.svg), and
+  [user stories](docs/user-stories.md) with acceptance criteria and the tests
+  that check them
+
+To re-render after editing a `.puml`:
+`docker run --rm -v "$PWD/docs/diagrams":/work -w /work plantuml/plantuml:1.2024.7 -tsvg '*.puml'`
 
 * **FastAPI**: typed request handling, validation and OpenAPI docs for little
   code. The upload is streamed to disk, so memory does not depend on file size.

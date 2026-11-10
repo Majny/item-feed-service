@@ -1,0 +1,37 @@
+@startuml use-cases
+!include _style.iuml
+title Use cases
+left to right direction
+
+actor "Client\n(customer integration)" as client
+actor "Operator" as ops
+actor "Image host" as host
+
+rectangle "Item Feed service" {
+  usecase "Upload a feed" as UC1
+  usecase "Retry an upload safely\n(Idempotency-Key)" as UC2
+  usecase "Check processing status" as UC3
+  usecase "List item IDs\n(paginated)" as UC4
+  usecase "Get an item with\nits images" as UC5
+  usecase "List downloaded images" as UC6
+  usecase "Download an image" as UC7
+  usecase "Download images\nin the background" as UC8
+  usecase "Scale workers" as UC9
+  usecase "Inspect dead letters\nand logs" as UC10
+  usecase "Health / readiness" as UC11
+}
+
+client --> UC1
+client --> UC2
+client --> UC3
+client --> UC4
+client --> UC5
+client --> UC6
+client --> UC7
+UC2 .> UC1 : <<extends>>
+UC1 .> UC8 : <<triggers>>
+UC8 --> host
+ops --> UC9
+ops --> UC10
+ops --> UC11
+@enduml

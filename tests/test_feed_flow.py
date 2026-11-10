@@ -83,6 +83,8 @@ def test_feed_is_processed_in_background(client, worker, image_server):
     assert cached.status_code == 304
     assert image_server.hits["/flaky.png"] == 2  # retried after the 503
     assert image_server.hits["/ok.png"] == 1  # shared image downloaded once
+    assert image_server.hits["/missing.png"] == 1  # 404 is permanent: not retried
+    assert image_server.hits["/page.html"] == 1  # not an image: not retried
 
 
 def test_duplicate_messages_do_not_duplicate_data(client, worker, image_server):
