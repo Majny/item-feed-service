@@ -31,7 +31,7 @@ loop items, batches of 500
   FW -> VOL : iterparse next items
   FW -> PG : upsert items, images (pending),\nreplace item_images
 end
-FW -> PG : SET parsed_at (and error if XML broke)
+FW -> PG : SET parsed_at (error if the XML broke\nor items were skipped; no items = failed)
 FW -> PG : pending image IDs
 FW -> QI : fetch_image(image_id) for each
 FW -> PG : finish feed if complete

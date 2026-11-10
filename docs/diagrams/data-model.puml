@@ -21,11 +21,10 @@ entity items {
   * item_id : varchar(255) <<PK>>  // the customer's g:id
   --
   title, description, link : text
-  price, sale_price : numeric(14,2)
+  price, sale_price : numeric  // exact, unscaled
   currency : varchar(3)
-  condition, availability, gtin : varchar(64)
-  brand : text
-  item_group_id : varchar(255)
+  condition, availability, gtin, brand : text
+  item_group_id : text
 }
 
 entity images {
@@ -34,9 +33,10 @@ entity images {
   * feed_id : uuid <<FK>>
   * url : text
   * status : pending | downloaded | failed
-  content_type : varchar(127)
+  content_type : text
   size_bytes : int
   error : text
+  * updated_at : timestamptz
 }
 
 entity item_images {
@@ -55,5 +55,6 @@ images ||--o{ item_images
 note bottom of images
   One row per distinct URL within a feed:
   a URL used by several items is downloaded once.
+  Index (feed_id, status) for the hot queries.
 end note
 @enduml

@@ -5,6 +5,24 @@ downloads their images in the background.
 
 Stack: Python 3.13, FastAPI, PostgreSQL, RabbitMQ, Dramatiq, httpx, defusedxml.
 
+Design at a glance:
+
+* **Two queues, two workers.** `feeds` parses and stores items, `images`
+  downloads one image per message. A slow image host never blocks parsing.
+* **At-least-once delivery, idempotent handlers.** Upserts, deterministic
+  image IDs and atomic file writes make a redelivered or duplicated message
+  harmless.
+* **Status derived from the database**, never counted from messages: a feed is
+  `done` when it is parsed and no image is pending.
+* **Retry only what can succeed later.** Transient errors back off and retry,
+  permanent ones (404, not an image, bad item values) are recorded at once.
+  Dead letters for inspection, and a sweeper re-publishes feeds that stopped
+  making progress.
+* **Streaming everywhere.** Upload to disk, XML parsing and image downloads
+  run in constant memory, with size limits and timeouts.
+* Trade-offs and what I would do next are at the end
+  ([Known shortcomings](#known-shortcomings)).
+
 ## Run
 
 ```sh
@@ -21,6 +39,7 @@ Services in `docker-compose.yml`:
 | `api`          | upload and read endpoints; never processes a feed itself  |
 | `feed-worker`  | consumes queue `feeds`: parses a feed, upserts items, publishes one message per image |
 | `image-worker` | consumes queue `images`: downloads one image and stores it |
+| `sweeper`      | every minute, re-publishes feeds stuck in `processing` (lost or dead-lettered messages) |
 | `db`           | PostgreSQL                                                |
 | `rabbitmq`     | message broker                                            |
 
@@ -33,7 +52,12 @@ Configuration (environment variables, defaults in `feedservice/config.py`):
 `DATABASE_URL`, `BROKER_URL`, `DATA_DIR`, `MAX_FEED_BYTES` (100 MB),
 `MAX_IMAGE_BYTES` (10 MB), `IMAGE_TIMEOUT_S` (10, per read; connect is 5 s),
 `IMAGE_DEADLINE_S` (60, reading the response body), `TASK_MAX_RETRIES` (5),
-`TASK_MIN_BACKOFF_MS` / `TASK_MAX_BACKOFF_MS` (1 s / 5 min).
+`TASK_MIN_BACKOFF_MS` / `TASK_MAX_BACKOFF_MS` (1 s / 5 min),
+`SWEEP_INTERVAL_S` (60), `SWEEP_STALE_AFTER_S` (1800).
+
+Dependencies are pinned in `requirements.lock` (runtime) and
+`requirements-test.lock`, generated from `pyproject.toml` with
+`uv pip compile`. The runtime image does not contain the tests or pytest.
 
 ## Tests
 
@@ -51,12 +75,13 @@ The other tests cover the failure cases from the reliability section below:
 the same feed message delivered twice, a redelivery after a worker died between
 two steps, a task killed by its time limit on the last attempt, a retried upload
 with an `Idempotency-Key`, a broker outage during upload, an image host that
-drips bytes, and a redirect loop.
+drips bytes, a redirect loop, items with values the database rejects, a
+document without items, and a feed whose messages were lost (the sweeper).
 
-Lint and format check (config in `pyproject.toml`):
+Lint, format and type check (config in `pyproject.toml`, `pip install -e ".[dev]"`):
 
 ```sh
-ruff check . && ruff format --check .
+ruff check . && ruff format --check . && mypy feedservice
 ```
 
 ## Example requests
@@ -122,9 +147,14 @@ curl -i -X POST http://localhost:8000/feeds \
   every upload is a new feed.
 * `GET /feeds/{id}` returns `status` as required, plus `items`, `images` counters
   and `error`. `failed` is an extension of the spec's `processing | done`: the
-  document could not be processed at all.
-* Item `price` and `sale_price` are decimal strings (`"299.00"`), not JSON
-  numbers, to avoid float rounding; `currency` is a separate field.
+  feed produced no usable items (XML broken before the first item, no items
+  with an ID, or processing gave up after retries). `error` on a `done` feed
+  says what was lost (XML broken after some items, items skipped). Internal
+  details stay in the logs; `error` only carries messages meant for the client.
+* Item `price` and `sale_price` are decimal strings exactly as in the feed
+  (`"299.00"`, `"12.345"`), not JSON numbers, so nothing is rounded;
+  `currency` is a separate field. A price the parser does not understand
+  (`"1,299.00 NOK"` with a thousands separator) becomes `null`.
 * Item and image lists return a plain JSON array as in the assignment. They are
   paginated with `?limit=` (default 1000, max 10000) and `?after=` (keyset
   cursor, the last ID of the previous page). If there may be more data, a
@@ -132,10 +162,13 @@ curl -i -X POST http://localhost:8000/feeds \
   item list can be partial; check the feed status.
 * `GET /feeds/{id}/images` lists only downloaded images, since only those can be
   fetched, ordered by image ID. Failed ones, and the per-item order, are
-  visible on the item with their URL and status.
+  visible on the item with their URL, status and the reason (`"HTTP 404"`).
 * Images are served with the content type the origin sent, an `ETag` and
   `Cache-Control: immutable`, because the content behind an image ID never
-  changes. `If-None-Match` returns `304`.
+  changes. `If-None-Match` (a list, weak tags or `*`) returns `304`. The bytes
+  come from the customer's host, so they are sent with `nosniff` and a
+  sandboxing `Content-Security-Policy`: an SVG with a script cannot run on
+  this origin.
 * Unknown feed, item or image: `404`. A malformed UUID in the path: `422`.
 * All errors have the same shape: `{"error": {"status": 404, "message": "feed not found"}}`.
   Validation errors add `"details"` with the offending fields.
@@ -190,23 +223,27 @@ Dependencies point one way: `api`, `feeds` and `tasks` use the modules below the
 | `api.py` | HTTP layer: routes, streaming the upload to disk, the (simple) read queries, response models, mapping errors to status codes |
 | `feeds.py` | Registering an upload: feed row, publish, `Idempotency-Key` replay, cleanup after a failed publish |
 | `tasks.py` | The two Dramatiq actors: parse and store items, download one image, retry/give-up decisions, feed completion |
+| `sweeper.py` | Periodic loop: re-publish feeds that stopped making progress |
 | `parser.py` | Streaming, XXE-safe XML to `ParsedItem`; pure, no I/O besides reading the file |
 | `images.py` | Downloading one image: timeouts, size and type checks, transient vs. permanent errors |
 | `db.py` | Schema and sessions |
 | `config.py` | Settings from environment variables |
 
 Module-level singletons (settings, engine, broker) instead of dependency
-injection: idiomatic for a service this size, and tests swap them with
-`monkeypatch`. With more code, the next step would be passing the downloader
+injection: idiomatic for a service this size. Tests configure them through
+environment variables before import (stub broker, test database) and replace
+single functions or settings with `monkeypatch`. With more code, the next step would be passing the downloader
 and the publisher into `tasks` and `feeds` explicitly.
 
 ### Data model
 
 * `feeds(id, status, parsed_at, error, idempotency_key UNIQUE, enqueued, created_at, updated_at)`
 * `items(feed_id, item_id, title, description, link, price, sale_price, currency, condition, availability, brand, gtin, item_group_id)`,
-  primary key `(feed_id, item_id)`. Price `"299.00 NOK"` is split into a
-  decimal and a currency code.
-* `images(id, feed_id, url, status, content_type, size_bytes, error)`.
+  primary key `(feed_id, item_id)`. Price `"299.00 NOK"` is split into an
+  unscaled `numeric` and a currency code. Free-text fields are `text`: feed
+  data has no reliable length limits.
+* `images(id, feed_id, url, status, content_type, size_bytes, error, updated_at)`,
+  indexed on `(feed_id, status)`, which every hot query filters by.
   `id = uuid5(feed_id, url)`: deterministic, so the same URL in one feed (the
   example uses one main image for all three items) is stored and downloaded once.
 * `item_images(feed_id, item_id, position, image_id)`: `g:image_link` is
@@ -240,17 +277,33 @@ design accepts that instead of trying to prevent it:
   `failed`, with the reason) and the message is moved to the dead-letter queue
   (`images.XQ`, `feeds.XQ`) for inspection. This includes a task killed by its
   time limit while it downloads: Dramatiq raises that as a `BaseException`,
-  which a plain `except Exception` would miss. Replaying a dead message alone
-  does nothing, since the row is already `failed`; reprocessing would need a
-  small replay command (not built) that resets the row to pending and re-sends.
+  which a plain `except Exception` would miss. Dramatiq keeps dead letters for
+  7 days (`dramatiq_dead_message_ttl`). Replaying a dead message alone does
+  nothing, since the row is already `failed`; reprocessing would need a small
+  replay command (not built) that resets the row to pending and re-sends.
 * **One bad image does not fail the feed.** The feed status is computed from DB
   state: `done` once all items are stored and no image is pending. It is not a
   counter updated by messages, so duplicate or reordered messages cannot corrupt
   it. The check runs in its own transaction after the image row is committed,
   so whichever worker finishes the last image sees the others too.
+* **Stuck feeds are recovered.** Some failures leave no message to redeliver:
+  the API crashed between inserting the feed and publishing it, or a database
+  outage outlasted the retries, so the image message was dead-lettered while
+  its row (which could not be written) is still `pending`. The `sweeper`
+  finds `processing` feeds with no progress for 30 min (parsing records
+  progress after every batch of 500 items, a finished image counts as
+  progress, so an active feed is not picked) and
+  publishes `process_feed` again. That task is idempotent: it parses only if
+  parsing has not finished, re-publishes every pending image and runs the
+  completion check.
+* **Bad data is not retried.** A value the database rejects in one item is a
+  property of the data. The batch is split until that item is isolated and
+  skipped; the rest of the catalog is stored and `error` says how many items
+  were skipped. Item IDs longer than 255 characters are skipped up front.
 * **Broken XML.** The example feed itself is missing the closing `</rss>` tag.
   Items that were complete before the error are kept, the feed ends as `done`
-  with the parse error in `error`. A document with no usable items ends as
+  with the parse error in `error`. A document with no usable items (broken
+  before the first item, or valid XML without any item with an ID) ends as
   `failed`. Parse errors are not retried because a retry cannot fix them.
   Being lenient is a deliberate choice because of the sample, and it has a
   risk: a truncated upload looks complete. A non-null `error` on a `done` feed
@@ -274,6 +327,9 @@ What happens when:
   `failed` and the feed finishes.
 * *The worker dies after storing an image but before checking the feed:* the
   redelivered message sees the image is done and runs the check.
+* *The DB is down for longer than the retries take (about a minute):* the
+  affected messages are dead-lettered and their rows stay `pending`; once the
+  DB is back, the sweeper re-publishes those feeds and they finish.
 * *The broker or the DB is down during upload:* the client gets `503` with
   `Retry-After` and retries. Without a key the feed row and file are removed;
   with a key they stay and the retry publishes the message again.
@@ -282,10 +338,11 @@ What happens when:
 * *The same file is uploaded twice on purpose:* two feeds. A feed is a
   snapshot of the catalog at upload time, so this is intended.
 
-## Mapping to a production setup like yours
+## Beyond the assignment: Kafka, Kubernetes, monitoring
 
-With **Kafka** instead of RabbitMQ the design stays the same, only the
-transport changes:
+The job ad mentions Kafka, Kubernetes and observability, so here is how this
+design would carry over. With **Kafka** instead of RabbitMQ the design stays
+the same, only the transport changes:
 
 * One topic per message type (`feed-uploaded` keyed by `feed_id`,
   `image-requested` keyed by `image_id`). Image messages need no ordering,
@@ -302,14 +359,15 @@ transport changes:
   steps: a transactional outbox table (written in the same DB transaction as
   the feed row, relayed to Kafka) removes the gap.
 
-On **Kubernetes** each of `api`, `feed-worker` and `image-worker` is its own
-Deployment with resource limits and graceful shutdown. Workers scale on queue
+On **Kubernetes** each of `api`, `feed-worker`, `image-worker` and `sweeper`
+is its own Deployment (the sweeper could also be a CronJob) with resource limits and graceful shutdown. Workers scale on queue
 lag (for example with KEDA), the API on CPU or request rate. Feed and image
 files move to object storage.
 
 What exists today: per-feed progress counters in `GET /feeds/{id}`, queue
 depth and the dead-letter queues in the RabbitMQ UI, `/health` and `/ready`,
-and log lines that carry `feed=<id>` (and `image=<id>`) in both workers.
+log lines that carry `feed=<id>` (and `image=<id>`) in both workers, and a
+WARNING from the sweeper for every feed it had to recover.
 
 What I would monitor: queue depth and age of the oldest message per queue,
 DLQ size (alert when it is not zero), task duration, retry and failure rate per
@@ -318,7 +376,7 @@ than N minutes, API latency and 5xx rate. Logs would be structured and carry
 `feed_id` so one feed can be followed across the services, and OpenTelemetry
 trace context would be passed in message headers.
 
-## GraphQL?
+## Why REST, not GraphQL
 
 Not here. The API is a handful of resource reads plus a file upload, and REST
 gets HTTP caching for immutable images for free. GraphQL would make sense if a
@@ -332,13 +390,14 @@ or cost limits.
 Roughly in the order I would fix them:
 
 * Upload writes the DB row and then publishes. If publishing fails the client
-  gets `503`, but the two steps are not atomic: a crash between them leaves a
-  feed that is never processed (unless the client retries with its key). A
-  transactional outbox would fix it.
-* If an image message is lost entirely, or the feed task exhausts its retries
-  while publishing image messages, the feed stays `processing`. A periodic
-  sweeper re-publishing old pending images (and alerting on feeds stuck in
-  `processing`) would close that.
+  gets `503`, but the two steps are not atomic: after a crash between them
+  the feed is only picked up by the sweeper, 30 min later. A transactional
+  outbox would make it immediate.
+* The sweeper's "no progress" rule cannot see messages that are only waiting:
+  a feed message stuck behind a backlog, or images that sit in a long queue or
+  in retry backoff, for more than 30 min with nothing finishing. Such a feed
+  is re-published early; the duplicate work is harmless (idempotent) but
+  wasted, and a duplicate image message can hit a struggling host again.
 * No per-host concurrency limit, rate limit or circuit breaker for image hosts:
   8 threads per worker times N workers can hammer one customer's CDN.
 * Image messages are published only after the whole feed is parsed, and a
@@ -364,6 +423,7 @@ Roughly in the order I would fix them:
   migrations.
 * No metrics endpoint or tracing yet (see the monitoring list above).
 * Item fields are fixed columns, as the assignment allows. Unknown feed elements
-  are ignored.
+  are ignored, and prices with thousands separators are not parsed.
+* `POST /feeds` takes the raw body only, no multipart form upload.
 * No deletion or retention of old feeds and their images (nor of `.part-`
   temp files a hard-killed worker can leave behind).

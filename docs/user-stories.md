@@ -31,17 +31,25 @@ As a client I want to poll the status and see progress and errors.
 - `GET /feeds/{id}` returns `processing`, `done` or `failed` with item and
   image counts (pending, downloaded, failed) and an error message.
 - A feed whose XML breaks after some items is `done` with an error, keeping
-  the items before the break.
+  the items before the break. A document without any usable item is `failed`
+  (not an empty "successful" catalog).
+- An item with a value the database rejects (or an ID over 255 characters)
+  is skipped and counted in `error`; the other items are stored, the feed is
+  not retried for it. Prices are stored exactly (`12.345 KWD`).
+- The error message is meant for the client; internal details stay in logs.
 - Tests: `test_feed_is_processed_in_background`,
-  `test_example_feed_items_are_parsed_even_though_the_document_is_truncated`.
+  `test_example_feed_items_are_parsed_even_though_the_document_is_truncated`,
+  `test_a_document_without_items_fails`,
+  `test_bad_items_are_skipped_and_the_rest_is_stored`,
+  `test_a_value_the_database_rejects_skips_only_that_item`.
 
 **4. Read the catalog.**
 As a client I want to list item IDs and read each item with its images.
 - `GET /feeds/{id}/items` returns sorted IDs, paginated with `limit`/`after`
   and a `Link: rel="next"` header.
 - `GET /feeds/{id}/items/{item_id}` returns the item with prices as decimal
-  strings and its images in feed order, each with its download status. IDs
-  containing `/` work.
+  strings and its images in feed order, each with its download status and,
+  for failed ones, the reason (`"HTTP 404"`). IDs containing `/` work.
 - Unknown feeds and items are `404`, malformed IDs `422`.
 - Tests: `test_feed_is_processed_in_background` (price string, image order
   and status), `test_pagination`, `test_unknown_resources_return_404`,
@@ -51,7 +59,10 @@ As a client I want to list item IDs and read each item with its images.
 As a client I want to list the downloaded images and fetch their bytes.
 - `GET /feeds/{id}/images` lists downloaded image IDs;
   `GET /feeds/{id}/images/{image_id}` returns the bytes with the original
-  content type, an `ETag` and long-lived caching (`304` on `If-None-Match`).
+  content type, an `ETag` and long-lived caching (`304` on `If-None-Match`,
+  also for a list of tags, weak tags and `*`).
+- The bytes come from a third party, so they are served with `nosniff` and a
+  sandboxing Content-Security-Policy (no script from an SVG on our origin).
 - Tests: `test_feed_is_processed_in_background`.
 
 ## Customer's image host (external system)
@@ -75,16 +86,22 @@ duplicate data or leave a feed stuck in `processing`.
   image message still completes the feed; a task killed by its time limit on
   the last attempt is recorded as a failed image.
 - An item repeated in the feed keeps only its last definition's images.
+- A feed whose messages are gone (a crash between saving and publishing, or
+  messages dead-lettered during a long database outage) is found by the
+  sweeper after 30 min without progress, re-published and finished.
 - Tests: `test_duplicate_messages_do_not_duplicate_data`,
   `test_redelivery_after_a_crash_still_finishes_the_feed`,
   `test_time_limit_on_the_last_attempt_is_recorded`,
-  `test_item_repeated_in_a_later_batch_keeps_only_its_last_images`.
+  `test_item_repeated_in_a_later_batch_keeps_only_its_last_images`,
+  `test_sweeper_recovers_a_feed_whose_messages_were_lost`.
 
 **8. Survive outages of the database or the queue.**
 As an operator I want outages to be visible and retryable, not to corrupt
 state.
 - A queue outage during upload returns `503` + `Retry-After` and leaves no
-  orphan row or file; a database outage returns `503` too.
+  orphan row or file; a database outage returns `503` too. Workers that
+  exhaust their retries during a database outage are covered by the sweeper
+  (story 7).
 - `/health` (liveness) and `/ready` (database reachable) for the orchestrator.
 - Tests: `test_queue_outage_returns_503_and_leaves_nothing_behind` (the
   database outage and `/ready` were checked by hand against the compose stack).

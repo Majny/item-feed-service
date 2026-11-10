@@ -19,6 +19,7 @@ rectangle "Item Feed service" {
   usecase "Scale workers" as UC9
   usecase "Inspect dead letters\nand logs" as UC10
   usecase "Health / readiness" as UC11
+  usecase "Recover stalled feeds\n(sweeper, automatic)" as UC12
 }
 
 client --> UC1
@@ -29,9 +30,10 @@ client --> UC5
 client --> UC6
 client --> UC7
 UC2 .> UC1 : <<extends>>
-UC1 .> UC8 : <<triggers>>
+UC1 .> UC8 : <<include>>
 UC8 --> host
 ops --> UC9
 ops --> UC10
 ops --> UC11
+ops --> UC12
 @enduml

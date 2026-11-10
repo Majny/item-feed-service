@@ -59,7 +59,13 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     yield
 
 
-app = FastAPI(title="Item Feed service", version="0.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="Item Feed service",
+    version="0.1.0",
+    lifespan=lifespan,
+    # Clean operation IDs (upload_feed, get_item, ...) for generated clients.
+    generate_unique_id_function=lambda route: route.name,
+)
 
 
 # ------------------------------------------------------------------ models
@@ -77,7 +83,10 @@ class ImageCounts(BaseModel):
 
 class FeedOut(BaseModel):
     id: uuid.UUID
-    status: FeedStatus = Field(description="`failed` = the document could not be processed at all")
+    status: FeedStatus = Field(
+        description="`failed` = no usable items: invalid XML before the first item, no item with an id, "
+        "every item rejected, or processing gave up after retries"
+    )
     error: str | None = Field(
         description="Set when something went wrong; on a `done` feed it means the XML was "
         "broken after some items, so the catalog may be incomplete"
@@ -90,6 +99,7 @@ class ImageRef(BaseModel):
     id: uuid.UUID
     url: str
     status: ImageStatus
+    error: str | None = Field(None, description="Why the download failed, e.g. 'HTTP 404'")
 
 
 class ItemOut(BaseModel):
@@ -182,7 +192,7 @@ def _get_feed(session: Session, feed_id: uuid.UUID) -> Feed:
     return feed
 
 
-def _paginate(request: Request, response: Response, ids: list[str], limit: int) -> list[str]:
+def _paginate[T](request: Request, response: Response, ids: list[T], limit: int) -> list[T]:
     """Fetch limit+1 rows; if the extra one exists, there is a next page."""
     page = ids[:limit]
     if len(ids) > limit:
@@ -263,7 +273,8 @@ async def upload_feed(
                     raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "feed too large")
                 if len(head) < 64:
                     head += chunk[:64]
-                fh.write(chunk)
+                # Off the event loop: a slow disk must not stall other requests.
+                await run_in_threadpool(fh.write, chunk)
         if size == 0:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "empty body")
         # Cheap sanity check only. Full XML validation happens in the worker
@@ -289,10 +300,10 @@ async def upload_feed(
     return _accepted(response, accepted_id)
 
 
-@app.get("/feeds/{feed_id}", responses=_errors(404, 422))
+@app.get("/feeds/{feed_id}", responses=_errors(404, 422, 503))
 def get_feed(feed_id: uuid.UUID, session: SessionDep) -> FeedOut:
     """Status is `processing`, `done` or `failed` (the last one is an extension
-    of the assignment: the document could not be processed at all)."""
+    of the assignment: the feed produced no usable items)."""
     feed = _get_feed(session, feed_id)
     items = session.scalar(select(func.count()).select_from(Item).where(Item.feed_id == feed_id))
     images = dict(
@@ -310,7 +321,7 @@ def get_feed(feed_id: uuid.UUID, session: SessionDep) -> FeedOut:
 # ------------------------------------------------------------------- items
 
 
-@app.get("/feeds/{feed_id}/items", responses=_errors(404, 422))
+@app.get("/feeds/{feed_id}/items", responses=_errors(404, 422, 503))
 def list_items(
     feed_id: uuid.UUID,
     request: Request,
@@ -329,14 +340,14 @@ def list_items(
     return _paginate(request, response, ids, limit)
 
 
-@app.get("/feeds/{feed_id}/items/{item_id:path}", responses=_errors(404, 422))
+@app.get("/feeds/{feed_id}/items/{item_id:path}", responses=_errors(404, 422, 503))
 def get_item(feed_id: uuid.UUID, item_id: str, session: SessionDep) -> ItemOut:
     _get_feed(session, feed_id)
     item = session.get(Item, (feed_id, item_id))
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "item not found")
     images = session.execute(
-        select(Image.id, Image.url, Image.status)
+        select(Image.id, Image.url, Image.status, Image.error)
         .join(ItemImage, ItemImage.image_id == Image.id)
         .where(ItemImage.feed_id == feed_id, ItemImage.item_id == item_id)
         .order_by(ItemImage.position)
@@ -358,14 +369,14 @@ def get_item(feed_id: uuid.UUID, item_id: str, session: SessionDep) -> ItemOut:
         brand=item.brand,
         gtin=item.gtin,
         item_group_id=item.item_group_id,
-        images=[ImageRef(id=i.id, url=i.url, status=i.status) for i in images],
+        images=[ImageRef(id=i.id, url=i.url, status=i.status, error=i.error) for i in images],
     )
 
 
 # ------------------------------------------------------------------ images
 
 
-@app.get("/feeds/{feed_id}/images", responses=_errors(404, 422))
+@app.get("/feeds/{feed_id}/images", responses=_errors(404, 422, 503))
 def list_images(
     feed_id: uuid.UUID,
     request: Request,
@@ -373,21 +384,21 @@ def list_images(
     session: SessionDep,
     limit: Limit = DEFAULT_PAGE,
     after: Annotated[uuid.UUID | None, Query(description="Cursor: last image ID of the previous page")] = None,
-) -> list[str]:
+) -> list[uuid.UUID]:
     """IDs of images that were downloaded and can be fetched, ordered by ID.
     Failed ones (and per-item order) are in GET /feeds/{id}/items/{item_id}."""
     _get_feed(session, feed_id)
     query = select(Image.id).where(Image.feed_id == feed_id, Image.status == ImageStatus.DOWNLOADED)
     if after is not None:
         query = query.where(Image.id > after)
-    ids = [str(i) for i in session.scalars(query.order_by(Image.id).limit(limit + 1))]
+    ids = list(session.scalars(query.order_by(Image.id).limit(limit + 1)))
     return _paginate(request, response, ids, limit)
 
 
 @app.get(
     "/feeds/{feed_id}/images/{image_id}",
     response_class=FileResponse,
-    responses={200: {"content": {"image/*": {}}}, 304: {"description": "Not modified"}, **_errors(404, 422)},
+    responses={200: {"content": {"image/*": {}}}, 304: {"description": "Not modified"}, **_errors(404, 422, 503)},
 )
 def get_image(feed_id: uuid.UUID, image_id: uuid.UUID, request: Request, session: SessionDep) -> Response:
     """The image bytes with the Content-Type the origin server sent.
@@ -399,10 +410,27 @@ def get_image(feed_id: uuid.UUID, image_id: uuid.UUID, request: Request, session
     image = session.get(Image, image_id)
     if image is None or image.feed_id != feed_id or image.status != ImageStatus.DOWNLOADED:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "image not found")
-    headers = {"ETag": f'"{image.id}"', "Cache-Control": "public, max-age=31536000, immutable"}
-    if request.headers.get("if-none-match") == headers["ETag"]:
+    etag = f'"{image.id}"'
+    headers = {
+        "ETag": etag,
+        "Cache-Control": "public, max-age=31536000, immutable",
+        # The bytes come from the customer's host. An SVG may contain script:
+        # never sniff the type, and if the file is opened directly, run it in
+        # a sandbox with nothing allowed, so it cannot act on this origin.
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+    }
+    if _etag_matches(request.headers.get("if-none-match"), etag):
         return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
     return FileResponse(image_path(image.id), media_type=image.content_type, headers=headers)
+
+
+def _etag_matches(if_none_match: str | None, etag: str) -> bool:
+    """If-None-Match: "*", a list of tags, weak or strong (RFC 9110 13.1.2)."""
+    if not if_none_match:
+        return False
+    tags = [t.strip().removeprefix("W/") for t in if_none_match.split(",")]
+    return "*" in tags or etag in tags
 
 
 # ------------------------------------------------------------------ health

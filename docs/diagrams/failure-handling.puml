@@ -18,9 +18,11 @@ else pending
   alt 200 with image/* content type
     IW -> PG : downloaded
     IW -> PG : finish feed if complete
+    IW --> QI : ack
   else permanent: 4xx (not 429), not an image,\ntoo large, bad URL, redirect loop
-    IW -> PG : failed (error stored)
+    IW -> PG : failed (reason stored, e.g. "HTTP 404")
     IW -> PG : finish feed if complete
+    IW --> QI : ack
   else transient (429, 5xx, timeout, connection error,\nbody deadline, time limit) or unexpected (bug, disk full)
     alt attempts left (5 retries)
       alt transient
@@ -31,7 +33,7 @@ else pending
     else last attempt
       IW -> PG : failed ("gave up after retries")
       IW -> PG : finish feed if complete
-      IW --> DLQ : message dead-lettered (logged at WARNING)
+      IW --> DLQ : message dead-lettered\n(Dramatiq logs it at ERROR)
     end
   end
 end
@@ -41,6 +43,8 @@ note over IW, PG
   status changes only WHERE status = pending, and the feed
   becomes done only when it is parsed and no image is pending.
   A worker killed at any point is safe: RabbitMQ redelivers
-  the unacked message (at-least-once delivery).
+  the unacked message (at-least-once delivery). If even the
+  last attempt cannot reach the database, the row stays
+  pending; the sweeper re-publishes the feed later.
 end note
 @enduml

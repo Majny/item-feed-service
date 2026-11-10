@@ -4,7 +4,9 @@ x-env: &env
   DATA_DIR: /data
 
 x-app: &app
-  build: .
+  build:
+    context: .
+    target: app
   environment: *env
   volumes:
     - data:/data
@@ -38,6 +40,12 @@ services:
     <<: *app
     command: ["dramatiq", "feedservice.tasks", "--queues", "images", "--processes", "1", "--threads", "8"]
 
+  # Re-publishes feeds stuck in "processing" (lost or dead-lettered messages).
+  # Stateless; running more than one copy is safe.
+  sweeper:
+    <<: *app
+    command: ["python", "-m", "feedservice.sweeper"]
+
   db:
     image: postgres:17-alpine
     environment:
@@ -67,7 +75,9 @@ services:
   # Test runner, not started by `docker compose up`:
   #   docker compose run --rm --build tests
   tests:
-    build: .
+    build:
+      context: .
+      target: test
     profiles: ["test"]
     command: ["pytest", "-v", "-p", "no:cacheprovider"]
     environment:

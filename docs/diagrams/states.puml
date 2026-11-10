@@ -8,15 +8,15 @@ state "Feed" as Feed {
   state "done" as FDone
   state "failed" as FFailed
   [*] --> FProcessing : POST /feeds accepted
-  FProcessing --> FProcessing : items stored\n(parsed_at set)
+  FProcessing --> FProcessing : items stored (parsed_at set);\nsweeper re-publishes after 30 min\nwithout progress
   FProcessing --> FDone : parsed_at set\nAND no image pending
-  FProcessing --> FFailed : XML broken before the first item,\nor processing failed after all retries
+  FProcessing --> FFailed : no usable item (XML broken before\nthe first one, or none with an id),\nor processing gave up after retries
   FDone --> [*]
   FFailed --> [*]
   note bottom of FDone
-    "done" with an error message:
-    the XML broke after some items,
-    the items before the break are kept.
+    "done" with an error message: the XML
+    broke after some items (those are kept)
+    or some items were skipped (bad values).
   end note
 }
 

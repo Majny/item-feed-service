@@ -12,6 +12,7 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     Integer,
     Numeric,
     String,
@@ -71,34 +72,47 @@ class Item(Base):
     __tablename__ = "items"
 
     feed_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("feeds.id", ondelete="CASCADE"), primary_key=True)
-    # The customer's own ID (<g:id>), unique only within a feed.
+    # The customer's own ID (<g:id>), unique only within a feed. Longer IDs
+    # are skipped by the worker (MAX_ITEM_ID_LEN).
     item_id: Mapped[str] = mapped_column(String(255), primary_key=True)
     title: Mapped[str | None] = mapped_column(Text)
     description: Mapped[str | None] = mapped_column(Text)
     link: Mapped[str | None] = mapped_column(Text)
-    price: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
-    sale_price: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
-    currency: Mapped[str | None] = mapped_column(String(3))
-    condition: Mapped[str | None] = mapped_column(String(64))
-    availability: Mapped[str | None] = mapped_column(String(64))
+    # Unscaled numeric: stores the amount exactly as written (3-decimal
+    # currencies, no overflow at some arbitrary precision). Free-text fields
+    # are Text: customer data has no reliable length limits, and one long
+    # value must not make a whole batch fail.
+    price: Mapped[Decimal | None] = mapped_column(Numeric)
+    sale_price: Mapped[Decimal | None] = mapped_column(Numeric)
+    currency: Mapped[str | None] = mapped_column(String(3))  # the parser only accepts 3 letters
+    condition: Mapped[str | None] = mapped_column(Text)
+    availability: Mapped[str | None] = mapped_column(Text)
     brand: Mapped[str | None] = mapped_column(Text)
-    gtin: Mapped[str | None] = mapped_column(String(64))
-    item_group_id: Mapped[str | None] = mapped_column(String(255))
+    gtin: Mapped[str | None] = mapped_column(Text)
+    item_group_id: Mapped[str | None] = mapped_column(Text)
 
 
 class Image(Base):
     __tablename__ = "images"
+    # Every hot query filters by feed and status: the completion check after
+    # each image, status counts, the list of downloaded images, re-publishing.
+    __table_args__ = (Index("ix_images_feed_status", "feed_id", "status"),)
 
     # Deterministic: uuid5(feed_id, url). A retried task computes the same ID,
     # so it cannot create a duplicate, and the same URL used by several items
     # of one feed is downloaded only once.
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
-    feed_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("feeds.id", ondelete="CASCADE"), index=True)
+    feed_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("feeds.id", ondelete="CASCADE"))
     url: Mapped[str] = mapped_column(Text)
     status: Mapped[ImageStatus] = mapped_column(_enum(ImageStatus), default=ImageStatus.PENDING)
-    content_type: Mapped[str | None] = mapped_column(String(127))
+    content_type: Mapped[str | None] = mapped_column(Text)
     size_bytes: Mapped[int | None] = mapped_column(Integer)
     error: Mapped[str | None] = mapped_column(Text)
+    # Lets the sweeper tell a feed whose images are still being worked on
+    # from one whose image messages were lost.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class ItemImage(Base):

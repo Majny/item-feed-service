@@ -71,6 +71,7 @@ def test_feed_is_processed_in_background(client, worker, image_server):
     assert item["title"] == "Bodylab Men''s T-shirt - Black"
     assert (item["price"], item["currency"], item["availability"]) == ("299.00", "NOK", "in stock")
     assert [i["status"] for i in item["images"]] == ["downloaded", "downloaded", "failed"]
+    assert item["images"][2]["error"] == "HTTP 404"
 
     image_ids = client.get(f"/feeds/{feed_id}/images").json()
     assert len(image_ids) == 2
@@ -79,8 +80,12 @@ def test_feed_is_processed_in_background(client, worker, image_server):
     assert img.headers["content-type"] == "image/png"
     assert img.content == PNG
     assert "immutable" in img.headers["cache-control"]
-    cached = client.get(f"/feeds/{feed_id}/images/{image_ids[0]}", headers={"If-None-Match": img.headers["etag"]})
-    assert cached.status_code == 304
+    assert img.headers["x-content-type-options"] == "nosniff"  # customer bytes, never sniffed
+    assert "sandbox" in img.headers["content-security-policy"]
+    etag = img.headers["etag"]
+    for if_none_match in (etag, f'"other", W/{etag}', "*"):
+        cached = client.get(f"/feeds/{feed_id}/images/{image_ids[0]}", headers={"If-None-Match": if_none_match})
+        assert cached.status_code == 304
     assert image_server.hits["/flaky.png"] == 2  # retried after the 503
     assert image_server.hits["/ok.png"] == 1  # shared image downloaded once
     assert image_server.hits["/missing.png"] == 1  # 404 is permanent: not retried
@@ -128,19 +133,15 @@ def test_pagination(client, worker, image_server):
     assert "link" not in second.headers
 
 
-def test_upload_validation(client):
+def test_upload_validation(client, monkeypatch):
     assert client.post("/feeds", content=b"<rss/>", headers={"Content-Type": "text/plain"}).status_code == 415
     assert client.post("/feeds", content=b"", headers=XML).status_code == 400
     resp = client.post("/feeds", content=b'{"json": true}', headers=XML)
     assert resp.status_code == 422
     assert resp.json() == {"error": {"status": 422, "message": "body is not XML"}}
 
-    limit = settings.max_feed_bytes
-    settings.max_feed_bytes = 10
-    try:
-        assert client.post("/feeds", content=b"<rss>" + b" " * 100 + b"</rss>", headers=XML).status_code == 413
-    finally:
-        settings.max_feed_bytes = limit
+    monkeypatch.setattr(settings, "max_feed_bytes", 10)
+    assert client.post("/feeds", content=b"<rss>" + b" " * 100 + b"</rss>", headers=XML).status_code == 413
 
 
 def test_unknown_resources_return_404(client, worker, image_server):
@@ -274,3 +275,75 @@ def test_item_id_with_a_slash_can_be_fetched(client, worker):
     wait_until_finished(client, feed_id)
     assert client.get(f"/feeds/{feed_id}/items").json() == ["SKU/1"]
     assert client.get(f"/feeds/{feed_id}/items/SKU%2F1").json()["title"] == "slashed"
+
+
+def rss(*items: str) -> bytes:
+    body = "".join(f"<item>{i}</item>" for i in items)
+    return f'<rss xmlns:g="http://base.google.com/ns/1.0"><channel>{body}</channel></rss>'.encode()
+
+
+def test_bad_items_are_skipped_and_the_rest_is_stored(client, worker):
+    """Bad data is not a transient error: retrying the feed cannot fix it, and
+    one bad item must not cost the customer the rest of the catalog."""
+    xml = rss(
+        "<g:id>ok-1</g:id><g:price>12.345 KWD</g:price><g:gtin>" + "9" * 70 + "</g:gtin>",
+        f"<g:id>{'x' * 300}</g:id>",
+        "<g:id>ok-2</g:id><g:price>99999999999999999999.99 USD</g:price>",
+    )
+    feed_id = client.post("/feeds", content=xml, headers=XML).json()["id"]
+    feed = wait_until_finished(client, feed_id)
+    assert feed["status"] == "done"
+    assert feed["items"] == 2
+    assert feed["error"] == "1 items skipped (id longer than 255 or invalid values)"
+    ok1 = client.get(f"/feeds/{feed_id}/items/ok-1").json()
+    assert (ok1["price"], ok1["currency"]) == ("12.345", "KWD")  # exact, no rounding to 2 places
+    assert client.get(f"/feeds/{feed_id}/items/ok-2").json()["price"] == "99999999999999999999.99"
+
+
+def test_a_value_the_database_rejects_skips_only_that_item(client, worker, monkeypatch):
+    # Let a too-long ID through the worker's own check, so the database
+    # rejects it (DataError) in the middle of a batch.
+    monkeypatch.setattr(tasks, "MAX_ITEM_ID_LEN", 10_000)
+    xml = rss("<g:id>a</g:id>", f"<g:id>{'x' * 300}</g:id>", "<g:id>b</g:id>", "<g:id>c</g:id>")
+    feed_id = client.post("/feeds", content=xml, headers=XML).json()["id"]
+    feed = wait_until_finished(client, feed_id)
+    assert (feed["status"], feed["items"]) == ("done", 3)
+    assert "1 items skipped" in feed["error"]
+    assert client.get(f"/feeds/{feed_id}/items").json() == ["a", "b", "c"]
+
+
+@pytest.mark.parametrize("body", [b"<rss><channel/></rss>", b"<html><body>hello</body></html>"])
+def test_a_document_without_items_fails(client, worker, body):
+    feed_id = client.post("/feeds", content=body, headers=XML).json()["id"]
+    feed = wait_until_finished(client, feed_id)
+    assert (feed["status"], feed["error"]) == ("failed", "no items with an id found")
+
+
+def test_sweeper_recovers_a_feed_whose_messages_were_lost(client, worker, image_server):
+    """E.g. a database outage outlasted the retries: the image message was
+    dead-lettered and its row is still pending. Nothing else would move it."""
+    from feedservice import sweeper
+
+    feed_id = uuid.uuid4()
+    url = f"{image_server.base_url}/ok.png"
+    with session_scope() as s:
+        s.add(Feed(id=feed_id, parsed_at=datetime.now(UTC)))
+        s.flush()
+        s.add(Image(id=image_id_for(feed_id, url), feed_id=feed_id, url=url))
+
+    assert sweeper.sweep_once() == []  # fresh: still within the grace period
+    assert sweeper.sweep_once(stale_after_s=0) == [feed_id]
+    feed = wait_until_finished(client, feed_id)
+    assert feed["status"] == "done"
+    assert feed["images"] == {"pending": 0, "downloaded": 1, "failed": 0}
+    assert sweeper.sweep_once(stale_after_s=0) == []  # finished feeds are left alone
+
+
+def test_sweeper_leaves_a_feed_that_reports_progress_alone():
+    from feedservice import sweeper
+
+    feed_id = uuid.uuid4()
+    with session_scope() as s:
+        s.add(Feed(id=feed_id, updated_at=datetime(2020, 1, 1, tzinfo=UTC)))  # uploaded long ago
+    tasks._heartbeat(feed_id)  # the worker has just stored a batch
+    assert sweeper.sweep_once(stale_after_s=60) == []

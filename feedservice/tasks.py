@@ -30,13 +30,15 @@ Reliability model:
 import logging
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import dramatiq
 from dramatiq.brokers.rabbitmq import RabbitmqBroker
 from dramatiq.brokers.stub import StubBroker
 from dramatiq.middleware import CurrentMessage, TimeLimitExceeded
-from sqlalchemy import delete, exists, select, update
+from sqlalchemy import delete, exists, func, select, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import DataError
 
 from .config import settings
 from .db import Feed, FeedStatus, Image, ImageStatus, Item, ItemImage, image_id_for, session_scope
@@ -54,12 +56,13 @@ else:
 broker.add_middleware(CurrentMessage())
 dramatiq.set_broker(broker)
 
-RETRY_OPTIONS = dict(
+RETRY_OPTIONS: dict[str, Any] = dict(
     max_retries=settings.max_retries,
     min_backoff=settings.min_backoff_ms,
     max_backoff=settings.max_backoff_ms,
 )
 BATCH_SIZE = 500
+MAX_ITEM_ID_LEN = 255  # items.item_id column
 # Below RabbitMQ's default consumer_timeout (30 min): past that RabbitMQ would
 # redeliver the unacked message while the first worker is still parsing. The
 # feed-worker prefetches only one message per thread for the same reason.
@@ -93,7 +96,9 @@ def process_feed(feed_id: str) -> None:
         except (Exception, TimeLimitExceeded) as exc:
             if _is_last_attempt():
                 log.exception("feed=%s: giving up after retries", fid)
-                _fail_feed(fid, f"processing failed after retries: {exc!r}")
+                # The details (driver errors, SQL) stay in the logs; the
+                # client gets a stable message it can quote to support.
+                _fail_feed(fid, f"internal error while processing, retried and gave up (feed={fid})")
             else:
                 log.warning("feed=%s: processing failed, will retry: %r", fid, exc)
             # Dramatiq retries with backoff; after the last attempt the message
@@ -112,37 +117,76 @@ def process_feed(feed_id: str) -> None:
 def _store_items(fid: uuid.UUID) -> None:
     path = settings.feeds_dir / f"{fid}.xml"
     parse_error: str | None = None
-    count = 0
+    count = skipped = 0
     batch: list[ParsedItem] = []
+
+    def flush() -> None:
+        nonlocal count, skipped, batch
+        rejected = _upsert_batch(fid, batch)
+        count += len(batch) - rejected
+        skipped += rejected
+        batch = []
+        _heartbeat(fid)
+
+    _heartbeat(fid)  # parsing started: the sweeper must not pick this feed
+
     with path.open("rb") as fh:
         try:
             for item in iter_items(fh):
+                if len(item.item_id) > MAX_ITEM_ID_LEN:
+                    log.warning("feed=%s: skipping item with a %d-char id", fid, len(item.item_id))
+                    skipped += 1
+                    continue
                 batch.append(item)
                 if len(batch) >= BATCH_SIZE:
-                    _upsert_batch(fid, batch)
-                    count += len(batch)
-                    batch = []
+                    flush()
         except FeedParseError as exc:
             # Malformed XML is not something a retry can fix. Items complete
             # before the error are kept; the error is recorded on the feed.
             parse_error = str(exc)
     if batch:
-        _upsert_batch(fid, batch)
-        count += len(batch)
+        flush()
     if parse_error:
         log.warning("feed=%s: parse error after %d items: %s", fid, count, parse_error)
 
+    problems = []
+    if parse_error:
+        problems.append(f"invalid XML after {count} items: {parse_error}")
+    if skipped:
+        problems.append(f"{skipped} items skipped (id longer than {MAX_ITEM_ID_LEN} or invalid values)")
+    if count == 0 and not parse_error and not skipped:
+        problems.append("no items with an id found")
+    values: dict[str, Any] = {"parsed_at": datetime.now(UTC), "error": "; ".join(problems) or None}
+    if count == 0:
+        # Nothing usable: an empty or wrong document must not look like a
+        # successfully imported (empty) catalog.
+        values["status"] = FeedStatus.FAILED
     with session_scope() as s:
-        feed = s.get(Feed, fid)
-        feed.parsed_at = datetime.now(UTC)
-        if parse_error:
-            feed.error = f"invalid XML after {count} items: {parse_error}"
-            if count == 0:
-                feed.status = FeedStatus.FAILED
-    log.info("feed=%s: stored %d items", fid, count)
+        # Only while processing: a concurrent delivery may have finished or
+        # failed the feed already, and its outcome must not be overwritten.
+        s.execute(update(Feed).where(Feed.id == fid, Feed.status == FeedStatus.PROCESSING).values(**values))
+    log.info("feed=%s: stored %d items, skipped %d", fid, count, skipped)
 
 
-def _upsert_batch(fid: uuid.UUID, batch: list[ParsedItem]) -> None:
+def _upsert_batch(fid: uuid.UUID, batch: list[ParsedItem]) -> int:
+    """Store a batch; returns how many items were rejected by the database.
+
+    A value the database refuses (DataError) is a property of the data, so
+    retrying cannot fix it. Instead of failing the whole feed, the batch is
+    split until the offending items are isolated and skipped.
+    """
+    try:
+        _write_batch(fid, batch)
+        return 0
+    except DataError as exc:
+        if len(batch) == 1:
+            log.warning("feed=%s: skipping item %r: %s", fid, batch[0].item_id, exc.orig)
+            return 1
+        mid = len(batch) // 2
+        return _upsert_batch(fid, batch[:mid]) + _upsert_batch(fid, batch[mid:])
+
+
+def _write_batch(fid: uuid.UUID, batch: list[ParsedItem]) -> None:
     # If an ID appears twice in a feed, the later definition wins (also across
     # batches: the item row is overwritten and its old image links deleted).
     by_id = {item.item_id: item for item in batch}
@@ -190,16 +234,29 @@ def _upsert_batch(fid: uuid.UUID, batch: list[ParsedItem]) -> None:
             )
 
 
+def _heartbeat(fid: uuid.UUID) -> None:
+    """Record progress (feeds.updated_at): the sweeper only re-publishes feeds
+    without progress, so one that is being parsed is never picked."""
+    with session_scope() as s:
+        active = (Feed.id == fid, Feed.status == FeedStatus.PROCESSING)
+        s.execute(update(Feed).where(*active).values(updated_at=func.now()))
+
+
 def _fail_feed(fid: uuid.UUID, error: str) -> None:
     with session_scope() as s:
-        s.execute(update(Feed).where(Feed.id == fid).values(status=FeedStatus.FAILED, error=error))
+        # Only a processing feed: a concurrent delivery may have finished it.
+        s.execute(
+            update(Feed)
+            .where(Feed.id == fid, Feed.status == FeedStatus.PROCESSING)
+            .values(status=FeedStatus.FAILED, error=error)
+        )
 
 
 def _finish_feed_if_complete(fid: uuid.UUID) -> None:
     # Runs in its own transaction *after* the image status was committed, so
     # whichever worker finishes the last image sees all others as finished.
     with session_scope() as s:
-        result = s.execute(
+        finished = s.execute(
             update(Feed)
             .where(
                 Feed.id == fid,
@@ -208,8 +265,9 @@ def _finish_feed_if_complete(fid: uuid.UUID) -> None:
                 ~exists().where(Image.feed_id == fid, Image.status == ImageStatus.PENDING),
             )
             .values(status=FeedStatus.DONE)
-        )
-    if result.rowcount:
+            .returning(Feed.id)
+        ).first()
+    if finished:
         log.info("feed=%s: done", fid)
 
 
@@ -254,7 +312,7 @@ def fetch_image(image_id: str) -> None:
         # Record the failure so the feed can finish, then re-raise so the
         # message ends up in the dead-letter queue (images.XQ).
         log.warning("feed=%s image=%s: giving up after retries (%r): %s", fid, iid, exc, url)
-        _set_image(iid, ImageStatus.FAILED, error=f"gave up after retries: {exc!r}")
+        _set_image(iid, ImageStatus.FAILED, error=f"gave up after retries: {_public_reason(exc)}")
         _finish_feed_if_complete(fid)
         raise
     else:
@@ -266,6 +324,16 @@ def fetch_image(image_id: str) -> None:
             error=None,
         )
     _finish_feed_if_complete(fid)
+
+
+def _public_reason(exc: BaseException) -> str:
+    """What the client sees in images.error: our own download errors are
+    meant for it ("HTTP 503", "timeout"), anything else stays in the logs."""
+    if isinstance(exc, TransientDownloadError):
+        return str(exc)
+    if isinstance(exc, TimeLimitExceeded):
+        return "download took too long"
+    return "internal error"
 
 
 def _set_image(iid: uuid.UUID, status: ImageStatus, **values: object) -> None:

@@ -22,6 +22,10 @@ node "image-worker (Dramatiq, 8 threads, scalable)" as iw {
   component "downloader\nimages.py" as dl
 }
 
+node "sweeper (every 60 s)" as sw {
+  component "sweep_once\nsweeper.py" as swc
+}
+
 database "PostgreSQL\nfeeds, items, images, item_images" as pg
 storage "Shared volume /data\nfeeds/<id>.xml, images/<image_id>" as vol
 cloud "Customer's image hosts" as hosts
@@ -43,4 +47,6 @@ parser ..> vol : read feed file
 pf ..> pg : (3) upsert items, images,\nitem_images in batches of 500
 fi ..> vol : (5) write image
 fi ..> pg : (5) image status,\nfeed completion check
+swc ..> pg : feeds "processing" with\nno progress for 30 min
+swc --> qf : re-publish process_feed
 @enduml

@@ -25,6 +25,12 @@ class Settings:
     min_backoff_ms: int = int(os.getenv("TASK_MIN_BACKOFF_MS", "1000"))
     max_backoff_ms: int = int(os.getenv("TASK_MAX_BACKOFF_MS", "300000"))
 
+    # Sweeper: a "processing" feed with no progress for this long is
+    # re-published. Parsing records progress after every batch and finishing
+    # images count as progress, so an active feed is not picked.
+    sweep_interval_s: float = float(os.getenv("SWEEP_INTERVAL_S", "60"))
+    sweep_stale_after_s: float = float(os.getenv("SWEEP_STALE_AFTER_S", "1800"))
+
     @property
     def feeds_dir(self) -> Path:
         return self.data_dir / "feeds"
